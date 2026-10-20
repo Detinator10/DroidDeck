@@ -2,10 +2,8 @@ package com.droiddeck.launcher.session
 
 import android.os.Process
 import java.io.File
-import java.io.IOException
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-import java.util.concurrent.RejectedExecutionException
 
 internal class SessionSuspendController(
     private val sessionRoot: () -> Int,
@@ -31,96 +29,102 @@ internal class SessionSuspendController(
         val parent: Int,
         val started: Long,
         val state: Char,
-        val tracer: Int,
+        val cpuTicks: Long,
     )
 
     private data class TaskIdentity(val process: ProcessRecord, val tid: Int, val started: Long)
-
     @Volatile private var closing = false
     private var frozen = emptyList<ProcessRecord>()
 
     fun freeze(completion: (Boolean) -> Unit) {
-        submit({
-            val records = frozen.associateByTo(LinkedHashMap()) { it.pid to it.started }
-            var complete = false
-            var interrupted = false
-            try {
-                val root = records.values.firstOrNull { it.role == Role.SESSION_ROOT }
-                    ?: readProcess(sessionRoot())?.takeIf { it.pid > 1 }?.let {
-                        ProcessRecord(it.pid, it.started, Role.SESSION_ROOT)
-                    } ?: throw IOException("Session root is unavailable")
-                records[root.pid to root.started] = root
-                runAudio(suspendAudio)
-                val helpers = helperRoots().filter { it > 1 && it != root.pid }.distinct()
-                for (helper in helpers) {
-                    if (records.values.any { it.pid == helper && it.role == Role.HELPER_ROOT }) continue
-                    readProcess(helper)?.let {
-                        records[it.pid to it.started] = ProcessRecord(it.pid, it.started, Role.HELPER_ROOT)
-                    }
-                }
-                val deadline = nowMillis() + FREEZE_TIMEOUT_MS
-                var previous: Map<TaskIdentity, Long>? = null
-                for (pass in 0 until FREEZE_MAX_PASSES) {
-                    if (closing || nowMillis() >= deadline) break
-                    try {
-                        if (readProcess(root.pid)?.started != root.started) break
-                        val includeRoots = pass >= 2
-                        addSnapshot(records, root.pid, helpers, includeRoots)
-                        if (readProcess(root.pid)?.started != root.started) break
-                        stop(records.values.toList(), includeRoots)
-                        sleep(if (pass == 0) 70L else 35L)
-                        if (closing || nowMillis() >= deadline) break
-                        val current = stoppedSnapshot(records.values.toList(), root)
-                        if (current != null && current == previous) {
-                            complete = true
-                            break
-                        }
-                        previous = current
-                    } catch (_: IOException) {
-                        previous = null
-                        sleep(35L)
-                    }
-                }
-            } catch (_: InterruptedException) {
-                interrupted = true
-                Thread.interrupted()
-            } catch (_: Exception) {
-            } finally {
-                frozen = records.values.toList()
-                if (!complete) {
-                    if (restoreSafely(frozen)) frozen = emptyList()
-                    runAudio(resumeAudio)
-                }
-                if (interrupted) Thread.currentThread().interrupt()
+        submit({ completion(false) }) {
+            if (closing) {
+                completion(false)
+                return@submit
             }
-            completion(complete)
-        }, { completion(false) })
+            if (frozen.isNotEmpty()) {
+                val before = stoppedSnapshot(frozen)
+                sleep(35L)
+                val fullyFrozen = before != null && stoppedSnapshot(frozen) == before
+                if (!fullyFrozen && restore(frozen)) frozen = emptyList()
+                completion(fullyFrozen)
+                return@submit
+            }
+            val records = LinkedHashMap<Pair<Int, Long>, ProcessRecord>()
+            val root = sessionRoot()
+            val started = readProcess(root)?.started
+            if (root <= 1 || started == null) {
+                completion(false)
+                return@submit
+            }
+            runAudio(suspendAudio)
+            val helpers = helperRoots().filter { it > 1 && it != root }.distinct()
+            var previous: Map<TaskIdentity, Long>? = null
+            var complete = false
+            val deadline = nowMillis() + FREEZE_TIMEOUT_MS
+            for (pass in 0 until FREEZE_MAX_PASSES) {
+                if (closing) {
+                    restore(records.values.toList())
+                    runAudio(resumeAudio)
+                    completion(false)
+                    return@submit
+                }
+                if (nowMillis() >= deadline) break
+                val includeRoots = pass >= 2
+                if (!addSnapshot(records, root, started, helpers, includeRoots)) break
+                stop(records.values.toList(), includeRoots)
+                sleep(if (pass == 0) 70L else 35L)
+                val current = stoppedSnapshot(records.values.toList())
+                if (closing || nowMillis() >= deadline) break
+                if (current != null && current == previous) {
+                    complete = true
+                    break
+                }
+                previous = current
+            }
+            if (complete) {
+                frozen = records.values.toList()
+                completion(true)
+            } else {
+                val restored = restore(records.values.toList())
+                runAudio(resumeAudio)
+                if (!restored) frozen = records.values.toList()
+                completion(false)
+            }
+        }
     }
 
     fun resume(completion: (Boolean) -> Unit) {
-        submit({
+        submit {
             val records = frozen
             runAudio(resumeAudio)
-            val resumed = restoreSafely(records)
+            val resumed = restore(records)
             if (resumed) frozen = emptyList()
             completion(resumed)
-        }, { completion(false) })
+        }
     }
 
     fun closeAndResume(completion: () -> Unit) {
         closing = true
-        submit({
-            if (restoreSafely(frozen)) frozen = emptyList()
+        submit {
+            restore(frozen)
+            frozen = emptyList()
             completion()
             executor.shutdown()
-        }, completion)
+        }
     }
 
-    private fun submit(task: () -> Unit, rejected: () -> Unit) {
+    private fun submit(rejected: (() -> Unit)? = null, task: () -> Unit) {
         try {
-            executor.execute(task)
-        } catch (_: RejectedExecutionException) {
-            rejected()
+            executor.execute {
+                try {
+                    task()
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                }
+            }
+        } catch (_: RuntimeException) {
+            if (rejected == null) task() else rejected()
         }
     }
 
@@ -134,30 +138,28 @@ internal class SessionSuspendController(
     private fun addSnapshot(
         records: MutableMap<Pair<Int, Long>, ProcessRecord>,
         root: Int,
+        started: Long,
         helpers: List<Int>,
         includeRoots: Boolean,
-    ) {
+    ): Boolean {
         val processes = readProcesses()
         val byPid = processes.associateBy { it.pid }
-        val rootRecord = records.values.first { it.role == Role.SESSION_ROOT }
-        if (byPid[root]?.started != rootRecord.started) throw IOException("Session root exited or changed")
-        val liveHelpers = helpers.filter { pid ->
-            records.values.any { it.pid == pid && it.role == Role.HELPER_ROOT && it.started == byPid[pid]?.started }
+        if (byPid[root]?.started != started) return false
+        for (process in descendants(root, processes, byPid)) {
+            records[process.pid to process.started] = ProcessRecord(process.pid, process.started, Role.SESSION_CHILD)
         }
-        for (process in descendants(root, processes, byPid) + processes.filter { it.tracer == root }) {
-            records.putIfAbsent(process.pid to process.started, ProcessRecord(process.pid, process.started, Role.SESSION_CHILD))
-        }
-        for (helper in liveHelpers) {
+        for (helper in helpers) {
             for (process in descendants(helper, processes, byPid)) {
-                records.putIfAbsent(process.pid to process.started, ProcessRecord(process.pid, process.started, Role.HELPER_CHILD))
+                records[process.pid to process.started] = ProcessRecord(process.pid, process.started, Role.HELPER_CHILD)
             }
         }
         if (includeRoots) {
             byPid[root]?.let { records[it.pid to it.started] = ProcessRecord(it.pid, it.started, Role.SESSION_ROOT) }
-            for (helper in liveHelpers) {
+            for (helper in helpers) {
                 byPid[helper]?.let { records[it.pid to it.started] = ProcessRecord(it.pid, it.started, Role.HELPER_ROOT) }
             }
         }
+        return true
     }
 
     private fun descendants(root: Int, processes: List<ProcessInfo>, byPid: Map<Int, ProcessInfo>): List<ProcessInfo> {
@@ -180,60 +182,26 @@ internal class SessionSuspendController(
     }
 
     private fun readProcesses(): List<ProcessInfo> =
-        (procRoot.listFiles() ?: throw IOException("Cannot enumerate processes")).mapNotNull { entry ->
+        procRoot.listFiles().orEmpty().mapNotNull { entry ->
             val pid = entry.name.toIntOrNull() ?: return@mapNotNull null
-            try { readProcess(pid) } catch (_: IOException) { null }
+            readProcess(pid)
         }
 
-    private fun readProcess(pid: Int): ProcessInfo? {
-        val base = File(procRoot, pid.toString())
-        try {
-            val fields = readStat(File(base, "stat"))
-            val tracer = File(base, "status").useLines { lines ->
-                lines.firstOrNull { it.startsWith("TracerPid:") }?.substringAfter(':')?.trim()?.toIntOrNull() ?: 0
-            }
-            return ProcessInfo(pid, fields[1].toInt(), fields[19].toLong(), fields[0].first(), tracer)
-        } catch (error: IOException) {
-            if (procRoot.list()?.contains(pid.toString()) == false) return null
-            throw error
+    private fun readProcess(pid: Int, statFile: File = File(procRoot, "$pid/stat")): ProcessInfo? {
+        val stat = try {
+            statFile.readText()
+        } catch (_: Exception) {
+            return null
         }
-    }
-
-    private fun readStat(file: File): List<String> {
-        val stat = file.readText()
         val close = stat.lastIndexOf(')')
-        if (close < 0 || close + 2 >= stat.length) throw IOException("Invalid process stat: $file")
+        if (close < 0 || close + 2 >= stat.length) return null
         val fields = stat.substring(close + 2).trim().split(Regex("\\s+"))
-        if (fields.size < 20) throw IOException("Incomplete process stat: $file")
-        return fields
-    }
-
-    private fun stoppedSnapshot(records: List<ProcessRecord>, root: ProcessRecord): Map<TaskIdentity, Long>? {
-        // PRoot can leave the leader stopped while native worker threads keep running.
-        val tasks = LinkedHashMap<TaskIdentity, Long>()
-        var stopped = true
-        for (record in records) {
-            val current = readProcess(record.pid)
-            if (current == null || current.started != record.started) {
-                if (record == root) throw IOException("Session root exited or changed")
-                continue
-            }
-            val entries = File(procRoot, "${record.pid}/task").listFiles()
-                ?: throw IOException("Cannot enumerate threads: ${record.pid}")
-            if (entries.none { it.name.toIntOrNull() != null }) throw IOException("Empty thread inventory: ${record.pid}")
-            var liveRoot = false
-            for (entry in entries) {
-                val tid = entry.name.toIntOrNull() ?: continue
-                val fields = readStat(File(entry, "stat"))
-                val state = fields[0].first()
-                if (state != 'Z' && state != 'X') liveRoot = true
-                if (state != 'T' && state != 't' && state != 'Z' && state != 'X') stopped = false
-                tasks[TaskIdentity(record, tid, fields[19].toLong())] = fields[11].toLong() + fields[12].toLong()
-            }
-            if (record == root && !liveRoot) throw IOException("Session root has no live threads")
-            if (readProcess(record.pid)?.started != record.started) throw IOException("Process changed during inspection")
+        if (fields.size < 20) return null
+        return try {
+            ProcessInfo(pid, fields[1].toInt(), fields[19].toLong(), fields[0].first(), fields[11].toLong() + fields[12].toLong())
+        } catch (_: NumberFormatException) {
+            null
         }
-        return tasks.takeIf { stopped && it.isNotEmpty() }
     }
 
     private fun stop(records: List<ProcessRecord>, includeRoots: Boolean) {
@@ -267,27 +235,47 @@ internal class SessionSuspendController(
         return false
     }
 
-    private fun restoreSafely(records: List<ProcessRecord>): Boolean = try {
-        restore(records)
-    } catch (_: InterruptedException) {
-        Thread.currentThread().interrupt()
-        false
-    } catch (_: Exception) {
-        false
-    }
-
     private fun send(record: ProcessRecord, signal: Int) {
-        val current = try { readProcess(record.pid) } catch (_: Exception) { return }
-        if (current == null || current.started != record.started) return
+        val current = readProcess(record.pid) ?: return
+        if (current.started != record.started) return
         try {
             this.signal(record.pid, signal)
         } catch (_: Throwable) {
         }
     }
 
+    private fun stoppedSnapshot(records: List<ProcessRecord>): Map<TaskIdentity, Long>? {
+        // PRoot can leave the leader stopped while native worker threads keep running.
+        try {
+            val tasks = LinkedHashMap<TaskIdentity, Long>()
+            var liveRoot = false
+            for (record in records) {
+                val current = readProcess(record.pid)
+                if (current == null) {
+                    if (procRoot.list()?.contains(record.pid.toString()) != false) return null
+                    continue
+                }
+                if (current.started != record.started) continue
+                val entries = File(procRoot, "${record.pid}/task").listFiles() ?: return null
+                if (entries.none { it.name.toIntOrNull() != null }) return null
+                for (entry in entries) {
+                    val tid = entry.name.toIntOrNull() ?: continue
+                    val task = readProcess(tid, File(entry, "stat")) ?: return null
+                    if (task.state != 'T' && task.state != 't' && task.state != 'Z' && task.state != 'X') return null
+                    if (record.role == Role.SESSION_ROOT && task.state != 'Z' && task.state != 'X') liveRoot = true
+                    tasks[TaskIdentity(record, tid, task.started)] = task.cpuTicks
+                }
+                if (readProcess(record.pid)?.started != record.started) return null
+            }
+            return tasks.takeIf { liveRoot && it.isNotEmpty() }
+        } catch (_: Exception) {
+            return null
+        }
+    }
+
     private fun isRunningOrGone(record: ProcessRecord): Boolean {
-        val current = try { readProcess(record.pid) } catch (_: Exception) { return false }
-        if (current == null || current.started != record.started) return true
+        val current = readProcess(record.pid) ?: return procRoot.list()?.contains(record.pid.toString()) == false
+        if (current.started != record.started) return true
         return current.state != 'T' && current.state != 't'
     }
 
